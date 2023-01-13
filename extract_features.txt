@@ -1,0 +1,183 @@
+from logging import exception
+from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401 isort:skip
+
+import argparse
+import os
+import json
+
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
+from PIL import Image
+
+from maskrcnn_benchmark.config import cfg
+from scene_graph_benchmark.config import sg_cfg
+from maskrcnn_benchmark.data import make_data_loader
+from maskrcnn_benchmark.data.datasets.utils.load_files import config_dataset_file
+from maskrcnn_benchmark.engine.inference import inference
+from scene_graph_benchmark.scene_parser import SceneParser
+from scene_graph_benchmark.AttrRCNN import AttrRCNN
+from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer
+from maskrcnn_benchmark.utils.collect_env import collect_env_info
+from maskrcnn_benchmark.utils.comm import synchronize, get_rank
+from maskrcnn_benchmark.utils.logger import setup_logger
+from maskrcnn_benchmark.utils.miscellaneous import mkdir
+
+from maskrcnn_benchmark.data.transforms import build_transforms
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+def cv2Img_to_Image(input_img):
+	cv2_img = input_img.copy()
+	img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+	img = Image.fromarray(img)
+	return img
+
+def get_relative_pos(x, batch_size, norm_len):
+	x = x.view(1, -1, 1).expand(batch_size, -1, -1)
+	return x / norm_len
+
+def get_grids_position(batch_size, grid_size):
+    x = torch.arange(0, grid_size[0]).float().cuda()
+    y = torch.arange(0, grid_size[1]).float().cuda()
+
+    px_min = x.view(-1, 1).expand(-1, grid_size[1]).contiguous().view(-1)
+    py_min = y.view(1, -1).expand(grid_size[0], -1).contiguous().view(-1)
+
+    px_max = px_min + 1
+    py_max = py_min + 1
+    rpx_min = get_relative_pos(px_min, batch_size, grid_size[0])
+    rpy_min = get_relative_pos(py_min, batch_size, grid_size[1])
+
+    rpx_max = get_relative_pos(px_max, batch_size, grid_size[0])
+    rpy_max = get_relative_pos(py_max, batch_size, grid_size[1])
+
+    boxes = torch.cat([rpx_min, rpy_min, rpx_max, rpy_max], dim=-1)
+    return boxes
+
+
+class VqaDataset(Dataset):
+    def __init__(self, image_dir, transformer):
+      super(VqaDataset,self).__init__()
+      
+      self.filenames = [ os.path.join(image_dir, filename) for filename in os.listdir(image_dir) ]
+      self.image_ids = [ int(filename.split(".")[0]) for filename in os.listdir(image_dir) ]
+    
+      self.transformer = transformer
+
+    def __len__(self):
+      return len(self.filenames)
+
+    def get_image(self, filename):
+      cv2_img = cv2.imread(filename)
+      img_input = cv2Img_to_Image(cv2_img)
+      img_input, _ = self.transformer(img_input, target = None)
+
+      return img_input
+
+    def __getitem__(self, index):
+      filename = self.filenames[index]
+      image_id = self.image_ids[index]
+
+      return image_id, self.get_image(filename)
+
+def main():
+    parser = argparse.ArgumentParser(description="PyTorch Object Detection Inference")
+    parser.add_argument(
+        "--config-file",
+        default="/private/home/fmassa/github/detectron.pytorch_v2/configs/e2e_faster_rcnn_R_50_C4_1x_caffe2.yaml",
+        metavar="FILE",
+        help="path to config file",
+    )
+    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument(
+        "--ckpt",
+        help="The path to the checkpoint for test, default is the latest checkpoint.",
+        default=None,
+    )
+    parser.add_argument(
+        "opts",
+        help="Modify config options using the command-line",
+        default=None,
+        nargs=argparse.REMAINDER,
+    )
+
+    args = parser.parse_args()
+
+    num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+    args.distributed = num_gpus > 1
+
+    cfg.set_new_allowed(True)
+    cfg.merge_from_other_cfg(sg_cfg)
+    cfg.set_new_allowed(False)
+    cfg.merge_from_file(args.config_file)
+    cfg.merge_from_list(args.opts)
+    cfg.freeze()
+
+    if args.distributed:
+        torch.cuda.set_device(args.local_rank)
+        torch.distributed.init_process_group(
+            backend=cfg.DISTRIBUTED_BACKEND, init_method="env://"
+        )
+        synchronize()
+
+    save_dir = ""
+    logger = setup_logger("maskrcnn_benchmark", save_dir, get_rank())
+    logger.info("Using {} GPUs".format(num_gpus))
+    logger.info(cfg)
+
+    logger.info("Collecting env info (might take some time)")
+    logger.info("\n" + collect_env_info())
+
+    if cfg.MODEL.META_ARCHITECTURE == "SceneParser":
+        model = SceneParser(cfg)
+    elif cfg.MODEL.META_ARCHITECTURE == "AttrRCNN":
+        model = AttrRCNN(cfg)
+    model.to(cfg.MODEL.DEVICE)
+
+    output_dir = cfg.OUTPUT_DIR
+    checkpointer = DetectronCheckpointer(cfg, model, save_dir=output_dir)
+    checkpointer.load(cfg.MODEL.WEIGHT)
+
+    dataset = VqaDataset("/content/images", build_transforms(cfg, is_train = False))
+    dataloader = DataLoader(
+      dataset = dataset,
+      batch_size = 1,
+      shuffle = True,
+      num_workers = 2
+    )
+
+    model.eval()
+    for image_id, image in tqdm(dataloader, desc = "Extracting", unit = "it"):
+        image_id = image_id[0]
+        image = image.to(cfg.MODEL.DEVICE)
+        with torch.no_grad():
+          prediction, grid_features = model(image)
+          prediction = prediction[0].to(torch.device("cpu"))
+          #region features
+          region_features = prediction.get_field("box_features")
+          region_boxes = prediction.bbox
+          #grid features
+          bs, c, h, w = grid_features.shape
+          grid_boxes = get_grids_position(bs, (w,h))
+          grid_features = grid_features.reshape(c, h*w).permute(1,0)
+          #save to npy files
+          np.save(
+            f"/content/drive/MyDrive/features/EVJVQA/vinvl_vinvl/{image_id}.npy",
+            {
+              "region_features": region_features,
+              "region_boxes": region_boxes,
+              "grid_features": grid_features,
+              "grid_boxes": grid_boxes,
+              "width": image.shape[-1],
+              "height": image.shape[-2]
+            },
+            allow_pickle = True
+          )
+
+
+
+if __name__ == "__main__":
+    main()
